@@ -141,7 +141,7 @@ public class Jersey2ApplicationClientFactory implements TransportClientFactory {
             ClientConfig clientConfig = new ClientConfig();
             
             for (ClientRequestFilter filter : additionalFilters) {
-                clientBuilder.register(filter);
+                clientConfig.register(filter);
             }
 
             for (Feature feature : features) {
@@ -228,6 +228,10 @@ public class Jersey2ApplicationClientFactory implements TransportClientFactory {
         private void addProviders(ClientConfig clientConfig) {
             DiscoveryJerseyProvider discoveryJerseyProvider = new DiscoveryJerseyProvider(encoderWrapper, decoderWrapper);
             clientConfig.register(discoveryJerseyProvider);
+
+            // Disable json autodiscovery, since json (de)serialization is provided by DiscoveryJerseyProvider
+            clientConfig.property(ClientProperties.JSON_PROCESSING_FEATURE_DISABLE, Boolean.TRUE);
+            clientConfig.property(ClientProperties.MOXY_JSON_FEATURE_DISABLE, Boolean.TRUE);
         }
     }
 }

@@ -176,6 +176,7 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
             logger.error("Cannot shutdown ReplicaAwareInstanceRegistry", t);
         }
         numberOfReplicationsLastMin.stop();
+        timer.cancel();
 
         super.shutdown();
     }
@@ -236,9 +237,8 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
     @Override
     public void openForTraffic(ApplicationInfoManager applicationInfoManager, int count) {
         // Renewals happen every 30 seconds and for a minute it should be a factor of 2.
-        this.expectedNumberOfRenewsPerMin = count * 2;
-        this.numberOfRenewsPerMinThreshold =
-                (int) (this.expectedNumberOfRenewsPerMin * serverConfig.getRenewalPercentThreshold());
+        this.expectedNumberOfClientsSendingRenews = count;
+        updateRenewsPerMinThreshold();
         logger.info("Got {} instances from neighboring DS node", count);
         logger.info("Renew threshold is: {}", numberOfRenewsPerMinThreshold);
         this.startupTime = System.currentTimeMillis();
@@ -377,14 +377,7 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
                           final boolean isReplication) {
         if (super.cancel(appName, id, isReplication)) {
             replicateToPeers(Action.Cancel, appName, id, null, null, isReplication);
-            synchronized (lock) {
-                if (this.expectedNumberOfRenewsPerMin > 0) {
-                    // Since the client wants to cancel it, reduce the threshold (1 for 30 seconds, 2 for a minute)
-                    this.expectedNumberOfRenewsPerMin = this.expectedNumberOfRenewsPerMin - 2;
-                    this.numberOfRenewsPerMinThreshold =
-                            (int) (this.expectedNumberOfRenewsPerMin * serverConfig.getRenewalPercentThreshold());
-                }
-            }
+
             return true;
         }
         return false;
@@ -531,11 +524,11 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
             }
             synchronized (lock) {
                 // Update threshold only if the threshold is greater than the
-                // current expected threshold of if the self preservation is disabled.
-                if ((count * 2) > (serverConfig.getRenewalPercentThreshold() * numberOfRenewsPerMinThreshold)
+                // current expected threshold or if self preservation is disabled.
+                if ((count) > (serverConfig.getRenewalPercentThreshold() * expectedNumberOfClientsSendingRenews)
                         || (!this.isSelfPreservationModeEnabled())) {
-                    this.expectedNumberOfRenewsPerMin = count * 2;
-                    this.numberOfRenewsPerMinThreshold = (int) ((count * 2) * serverConfig.getRenewalPercentThreshold());
+                    this.expectedNumberOfClientsSendingRenews = count;
+                    updateRenewsPerMinThreshold();
                 }
             }
             logger.info("Current renewal threshold is : {}", numberOfRenewsPerMinThreshold);
@@ -649,7 +642,7 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
                                                  String id, InstanceInfo info, InstanceStatus newStatus,
                                                  PeerEurekaNode node) {
         try {
-            InstanceInfo infoFromRegistry = null;
+            InstanceInfo infoFromRegistry;
             CurrentRequestVersion.set(Version.V2);
             switch (action) {
                 case Cancel:
@@ -674,6 +667,8 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
             }
         } catch (Throwable t) {
             logger.error("Cannot replicate information to {} for action {}", node.getServiceUrl(), action.name(), t);
+        } finally {
+            CurrentRequestVersion.remove();
         }
     }
 
@@ -688,6 +683,8 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
             node.statusUpdate(asgName, newStatus);
         } catch (Throwable e) {
             logger.error("Cannot replicate ASG status information to {}", node.getServiceUrl(), e);
+        } finally {
+            CurrentRequestVersion.remove();
         }
     }
 

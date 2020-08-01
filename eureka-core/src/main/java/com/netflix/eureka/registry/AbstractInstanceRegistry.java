@@ -19,6 +19,7 @@ package com.netflix.eureka.registry;
 import javax.annotation.Nullable;
 import java.net.MalformedURLException;
 import java.net.URL;
+import java.util.AbstractQueue;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -30,6 +31,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
@@ -101,7 +103,7 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
 
     protected String[] allKnownRemoteRegions = EMPTY_STR_ARRAY;
     protected volatile int numberOfRenewsPerMinThreshold;
-    protected volatile int expectedNumberOfRenewsPerMin;
+    protected volatile int expectedNumberOfClientsSendingRenews;
 
     protected final EurekaServerConfig serverConfig;
     protected final EurekaClientConfig clientConfig;
@@ -218,13 +220,10 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
             } else {
                 // The lease does not exist and hence it is a new registration
                 synchronized (lock) {
-                    if (this.expectedNumberOfRenewsPerMin > 0) {
-                        // Since the client wants to cancel it, reduce the threshold
-                        // (1
-                        // for 30 seconds, 2 for a minute)
-                        this.expectedNumberOfRenewsPerMin = this.expectedNumberOfRenewsPerMin + 2;
-                        this.numberOfRenewsPerMinThreshold =
-                                (int) (this.expectedNumberOfRenewsPerMin * serverConfig.getRenewalPercentThreshold());
+                    if (this.expectedNumberOfClientsSendingRenews > 0) {
+                        // Since the client wants to register it, increase the number of clients sending renews
+                        this.expectedNumberOfClientsSendingRenews = this.expectedNumberOfClientsSendingRenews + 1;
+                        updateRenewsPerMinThreshold();
                     }
                 }
                 logger.debug("No previous lease information found; it is new registration");
@@ -234,11 +233,9 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
                 lease.setServiceUpTimestamp(existingLease.getServiceUpTimestamp());
             }
             gMap.put(registrant.getId(), lease);
-            synchronized (recentRegisteredQueue) {
-                recentRegisteredQueue.add(new Pair<Long, String>(
-                        System.currentTimeMillis(),
-                        registrant.getAppName() + "(" + registrant.getId() + ")"));
-            }
+            recentRegisteredQueue.add(new Pair<Long, String>(
+                    System.currentTimeMillis(),
+                    registrant.getAppName() + "(" + registrant.getId() + ")"));
             // This is where the initial state transfer of overridden status happens
             if (!InstanceStatus.UNKNOWN.equals(registrant.getOverriddenStatus())) {
                 logger.debug("Found overridden status {} for instance {}. Checking to see if needs to be add to the "
@@ -306,9 +303,7 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
             if (gMap != null) {
                 leaseToCancel = gMap.remove(id);
             }
-            synchronized (recentCanceledQueue) {
-                recentCanceledQueue.add(new Pair<Long, String>(System.currentTimeMillis(), appName + "(" + id + ")"));
-            }
+            recentCanceledQueue.add(new Pair<Long, String>(System.currentTimeMillis(), appName + "(" + id + ")"));
             InstanceStatus instanceStatus = overriddenInstanceStatusMap.remove(id);
             if (instanceStatus != null) {
                 logger.debug("Removed instance id {} from the overridden map which has value {}", id, instanceStatus.name());
@@ -331,11 +326,20 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
                 }
                 invalidateCache(appName, vip, svip);
                 logger.info("Cancelled instance {}/{} (replication={})", appName, id, isReplication);
-                return true;
             }
         } finally {
             read.unlock();
         }
+
+        synchronized (lock) {
+            if (this.expectedNumberOfClientsSendingRenews > 0) {
+                // Since the client wants to cancel it, reduce the number of clients to send renews.
+                this.expectedNumberOfClientsSendingRenews = this.expectedNumberOfClientsSendingRenews - 1;
+                updateRenewsPerMinThreshold();
+            }
+        }
+
+        return true;
     }
 
     /**
@@ -481,7 +485,7 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
                     if (InstanceStatus.UP.equals(newStatus)) {
                         lease.serviceUp();
                     }
-                    // This is NAC overriden status
+                    // This is NAC overridden status
                     overriddenInstanceStatusMap.put(id, newStatus);
                     // Set it for transfer of overridden status to replica on
                     // replica start up
@@ -489,7 +493,7 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
                     long replicaDirtyTimestamp = 0;
                     info.setStatusWithoutDirty(newStatus);
                     if (lastDirtyTimestamp != null) {
-                        replicaDirtyTimestamp = Long.valueOf(lastDirtyTimestamp);
+                        replicaDirtyTimestamp = Long.parseLong(lastDirtyTimestamp);
                     }
                     // If the replication's dirty timestamp is more than the existing one, just update
                     // it to the replica's.
@@ -550,7 +554,7 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
                     info.setStatusWithoutDirty(newStatus);
                     long replicaDirtyTimestamp = 0;
                     if (lastDirtyTimestamp != null) {
-                        replicaDirtyTimestamp = Long.valueOf(lastDirtyTimestamp);
+                        replicaDirtyTimestamp = Long.parseLong(lastDirtyTimestamp);
                     }
                     // If the replication's dirty timestamp is more than the existing one, just update
                     // it to the replica's.
@@ -888,7 +892,7 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
                     applicationInstancesMap.put(instanceInfo.getAppName(), app);
                     apps.addApplication(app);
                 }
-                app.addInstance(decorateInstanceInfo(lease));
+                app.addInstance(new InstanceInfo(decorateInstanceInfo(lease)));
             }
 
             boolean disableTransparentFallback = serverConfig.disableTransparentFallbackToOtherRegion();
@@ -965,7 +969,7 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
                     applicationInstancesMap.put(instanceInfo.getAppName(), app);
                     apps.addApplication(app);
                 }
-                app.addInstance(decorateInstanceInfo(lease));
+                app.addInstance(new InstanceInfo(decorateInstanceInfo(lease)));
             }
 
             if (includeRemoteRegion) {
@@ -983,7 +987,7 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
                                         apps.addApplication(appInstanceTillNow);
                                     }
                                     for (InstanceInfo instanceInfo : application.getInstances()) {
-                                        appInstanceTillNow.addInstance(instanceInfo);
+                                        appInstanceTillNow.addInstance(new InstanceInfo(instanceInfo));
                                     }
                                 }
                             }
@@ -1159,13 +1163,7 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
      */
     @Override
     public List<Pair<Long, String>> getLastNRegisteredInstances() {
-        List<Pair<Long, String>> list = new ArrayList<Pair<Long, String>>();
-
-        synchronized (recentRegisteredQueue) {
-            for (Pair<Long, String> aRecentRegisteredQueue : recentRegisteredQueue) {
-                list.add(aRecentRegisteredQueue);
-            }
-        }
+        List<Pair<Long, String>> list = new ArrayList<Pair<Long, String>>(recentRegisteredQueue);
         Collections.reverse(list);
         return list;
     }
@@ -1177,12 +1175,7 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
      */
     @Override
     public List<Pair<Long, String>> getLastNCanceledInstances() {
-        List<Pair<Long, String>> list = new ArrayList<Pair<Long, String>>();
-        synchronized (recentCanceledQueue) {
-            for (Pair<Long, String> aRecentCanceledQueue : recentCanceledQueue) {
-                list.add(aRecentCanceledQueue);
-            }
-        }
+        List<Pair<Long, String>> list = new ArrayList<Pair<Long, String>>(recentCanceledQueue);
         Collections.reverse(list);
         return list;
     }
@@ -1190,6 +1183,12 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
     private void invalidateCache(String appName, @Nullable String vipAddress, @Nullable String secureVipAddress) {
         // invalidate cache
         responseCache.invalidate(appName, vipAddress, secureVipAddress);
+    }
+
+    protected void updateRenewsPerMinThreshold() {
+        this.numberOfRenewsPerMinThreshold = (int) (this.expectedNumberOfClientsSendingRenews
+                * (60.0 / serverConfig.getExpectedClientRenewalIntervalSeconds())
+                * serverConfig.getRenewalPercentThreshold());
     }
 
     private static final class RecentlyChangedItem {
@@ -1229,6 +1228,7 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
         deltaRetentionTimer.cancel();
         evictionTimer.cancel();
         renewsLastMin.stop();
+        responseCache.stop();
     }
 
     @com.netflix.servo.annotations.Monitor(name = "numOfElementsinInstanceCache", description = "Number of overrides in the instance Cache", type = DataSourceType.GAUGE)
@@ -1275,29 +1275,52 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
 
     }
 
-    private class CircularQueue<E> extends ConcurrentLinkedQueue<E> {
-        private int size = 0;
+    /* visible for testing */ static class CircularQueue<E> extends AbstractQueue<E> {
 
-        public CircularQueue(int size) {
-            this.size = size;
+        private final ArrayBlockingQueue<E> delegate;
+        private final int capacity;
+
+        public CircularQueue(int capacity) {
+            this.capacity = capacity;
+            this.delegate = new ArrayBlockingQueue<>(capacity);
         }
 
         @Override
-        public boolean add(E e) {
-            this.makeSpaceIfNotAvailable();
-            return super.add(e);
-
+        public Iterator<E> iterator() {
+            return delegate.iterator();
         }
 
-        private void makeSpaceIfNotAvailable() {
-            if (this.size() == size) {
-                this.remove();
-            }
+        @Override
+        public int size() {
+            return delegate.size();
         }
 
+        @Override
         public boolean offer(E e) {
-            this.makeSpaceIfNotAvailable();
-            return super.offer(e);
+            while (!delegate.offer(e)) {
+                delegate.poll();
+            }
+            return true;
+        }
+
+        @Override
+        public E poll() {
+            return delegate.poll();
+        }
+
+        @Override
+        public E peek() {
+            return delegate.peek();
+        }
+
+        @Override
+        public void clear() {
+            delegate.clear();
+        }
+
+        @Override
+        public Object[] toArray() {
+            return delegate.toArray();
         }
     }
 

@@ -128,7 +128,7 @@ public class ResponseCacheImpl implements ResponseCache {
 
         long responseCacheUpdateIntervalMs = serverConfig.getResponseCacheUpdateIntervalMs();
         this.readWriteCacheMap =
-                CacheBuilder.newBuilder().initialCapacity(1000)
+                CacheBuilder.newBuilder().initialCapacity(serverConfig.getInitialCapacityOfResponseCache())
                         .expireAfterWrite(serverConfig.getResponseCacheAutoExpirationInSeconds(), TimeUnit.SECONDS)
                         .removalListener(new RemovalListener<Key, Value>() {
                             @Override
@@ -185,6 +185,8 @@ public class ResponseCacheImpl implements ResponseCache {
                         }
                     } catch (Throwable th) {
                         logger.error("Error while updating the client cache from response cache for key {}", key.toStringCompact(), th);
+                    } finally {
+                        CurrentRequestVersion.remove();
                     }
                 }
             }
@@ -232,6 +234,12 @@ public class ResponseCacheImpl implements ResponseCache {
             return null;
         }
         return payload.getGzipped();
+    }
+
+    @Override
+    public void stop() {
+        timer.cancel();
+        Monitors.unregisterObject(this);
     }
 
     /**
